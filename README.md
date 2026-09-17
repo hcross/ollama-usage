@@ -72,7 +72,7 @@ Point claude-hud at the snapshot in `~/.claude/plugins/claude-hud/config.json`:
 ```json
 {
   "display": {
-    "externalUsagePath": "~home-absolute-path~/.claude/plugins/claude-hud/ollama-usage.json",
+    "externalUsagePath": "/home/YOU/.claude/plugins/claude-hud/ollama-usage.json",
     "externalBalanceLabelMode": "ollama-cloud"
   }
 }
