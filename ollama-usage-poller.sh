@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
-# ollama-usage-poller.sh — Polls the Ollama cloud usage API and writes a
+# ollama-usage-poller.sh — Polls the Ollama cloud balance API and writes a
 # claude-hud external-usage snapshot.
 #
-# The snapshot format matches claude-hud's `externalUsagePath` contract
-# (see src/external-usage.ts): five_hour / seven_day percentages with an
-# updated_at timestamp. claude-hud reads it as a fallback when stdin carries
-# no rate_limits (i.e. when Claude Code runs against Ollama).
+# The quota lives in https://ollama.com/api/balance since the 2026-08 pricing
+# change: /api/usage now carries only per-request metrics (request counts, USD,
+# tokens) and no longer exposes limit windows. The snapshot format still
+# matches claude-hud's `externalUsagePath` contract (see src/external-usage.ts):
+# five_hour / seven_day used-percentage with an updated_at timestamp.
+# claude-hud reads it as a fallback when stdin carries no rate_limits (i.e.
+# when Claude Code runs against Ollama).
+#
+# Included-balance shapes (docs.ollama.com/api/balance — `included` is a oneOf):
+#   - Legacy plans: `session` / `weekly` objects with `remaining_percent`
+#     (0-100, quota REMAINING, not consumed — convert with used = 100 − rest)
+#     and `resets_at`. Maps 1:1 to the snapshot's five_hour / seven_day bars.
+#   - Standard plans: `balance_usd` / `allowance_usd` / `period` monthly
+#     credits. No 5h/weekly windows exist, so the bars are written as null and
+#     only the balance label is populated.
+# `purchased.balance_usd` (remaining unexpired purchased credits) applies to
+# both shapes and feeds the snapshot's `balance_label`.
 #
 # Usage:
 #   ollama-usage-poller.sh --once   # fetch once and exit (launchd mode)
@@ -13,6 +26,7 @@
 #
 # Env:
 #   OLLAMA_API_KEY                  # explicit key (takes precedence)
+#   OLLAMA_BALANCE_URL              # default: https://ollama.com/api/balance (test seam)
 #   OLLAMA_USAGE_SNAPSHOT_PATH      # default: ~/.claude/plugins/claude-hud/ollama-usage.json
 #   OLLAMA_USAGE_POLL_INTERVAL      # daemon mode only, seconds (default 120)
 set -euo pipefail
@@ -21,7 +35,7 @@ set -euo pipefail
 # regardless of the system locale (e.g. fr_FR uses ',').
 export LC_ALL=C
 
-API_URL="https://ollama.com/api/usage"
+BALANCE_URL="${OLLAMA_BALANCE_URL:-https://ollama.com/api/balance}"
 SNAPSHOT_PATH="${OLLAMA_USAGE_SNAPSHOT_PATH:-$HOME/.claude/plugins/claude-hud/ollama-usage.json}"
 POLL_INTERVAL="${OLLAMA_USAGE_POLL_INTERVAL:-120}"
 
@@ -47,59 +61,96 @@ else
   epoch_to_iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
 fi
 
+# Ollama cloud usage windows are fixed and epoch-aligned (maintainer
+# rick-github, ollama/ollama#12532); the API returns resets_at, this only
+# stands in when the field is absent:
+#   session: 5h blocks, reset at the next multiple of 18000s since epoch
+#   weekly:  7d blocks shifted by 4 days, reset at the next multiple of
+#            604800s since epoch (Monday 00:00 UTC)
+epoch_fallback_reset() {
+  local epoch window shift
+  epoch="$(date +%s)"
+  case "$1" in
+    session) window=18000; shift_count=0 ;;
+    weekly)  window=604800; shift_count=345600 ;;
+    *) return ;;
+  esac
+  epoch_to_iso "$((epoch + (window - ((epoch - shift_count) % window))))"
+}
+
 fetch_and_write() {
-  local resp
-  resp="$(curl -fsS -m 15 -H "Authorization: Bearer $API_KEY" "$API_URL")" || return 1
+  local balance
+  balance="$(curl -fsS -m 15 -H "Authorization: Bearer $API_KEY" "$BALANCE_URL")" || return 1
 
-  local session weekly
-  session="$(printf '%s' "$resp" | jq -r '.limits.session.usage // 0')"
-  weekly="$(printf '%s' "$resp" | jq -r '.limits.weekly.usage // 0')"
+  # remaining_percent is the quota REMAINING (75 means 75% left); the snapshot
+  # wants used_percentage, hence the 100 − conversion, clamped to [0, 100].
+  local session_remaining weekly_remaining
+  session_remaining="$(printf '%s' "$balance" | jq -r '.included.session.remaining_percent // empty')"
+  weekly_remaining="$(printf '%s' "$balance" | jq -r '.included.weekly.remaining_percent // empty')"
+  local session_pct_json="null" weekly_pct_json="null"
 
-  # The API returns fractional usage (0.504 = 50.4%); claude-hud expects a
-  # 0-100 percentage.
-  local session_pct weekly_pct
-  session_pct="$(awk -v v="$session" 'BEGIN{printf "%.1f", v*100}')"
-  weekly_pct="$(awk -v v="$weekly" 'BEGIN{printf "%.1f", v*100}')"
+  if [[ -n "$session_remaining" ]]; then
+    session_pct_json="$(awk -v r="$session_remaining" 'BEGIN{u=100-r; u=u<0?0:u>100?100:u; printf "%.2f", u}')"
+  fi
+  if [[ -n "$weekly_remaining" ]]; then
+    weekly_pct_json="$(awk -v r="$weekly_remaining" 'BEGIN{u=100-r; u=u<0?0:u>100?100:u; printf "%.2f", u}')"
+  fi
 
-  # activity.cost = cumulative extra-usage cost over a rolling 4-week window
-  # (drawn from the extra usage balance once plan limits are exhausted).
-  # Rendered by claude-hud via the snapshot's balance_label field.
-  local cost cost_label
-  cost="$(printf '%s' "$resp" | jq -r '.activity.cost // ""')"
-  if [[ -n "$cost" ]]; then
-    cost_label="$(awk -v c="$cost" 'BEGIN{printf "Xtr: $%.2f/4wk", c}')"
-  else
-    cost_label=""
+  # Preferred: the API-provided reset timestamps; epoch-aligned math only as a
+  # stand-in when the field is absent while the window is present.
+  local session_reset weekly_reset
+  session_reset="$(printf '%s' "$balance" | jq -r '.included.session.resets_at // empty')"
+  weekly_reset="$(printf '%s' "$balance" | jq -r '.included.weekly.resets_at // empty')"
+  if [[ -n "$session_remaining" && -z "$session_reset" ]]; then
+    session_reset="$(epoch_fallback_reset session)"
+  fi
+  if [[ -n "$weekly_remaining" && -z "$weekly_reset" ]]; then
+    weekly_reset="$(epoch_fallback_reset weekly)"
+  fi
+
+  # Balance labels: `included` differs by plan shape and `purchased` is the
+  # remaining unexpired prepaid credits (rendered verbatim by the HUD at the
+  # end of the usage line via the snapshot's balance_label field).
+  local included_usd allowance_usd purchased cost_label
+  included_usd="$(printf '%s' "$balance" | jq -r '.included.balance_usd // empty')"
+  allowance_usd="$(printf '%s' "$balance" | jq -r '.included.allowance_usd // empty')"
+  purchased="$(printf '%s' "$balance" | jq -r '.purchased.balance_usd // empty')"
+  cost_label=""
+  if [[ -n "$allowance_usd" && -n "$included_usd" ]]; then
+    cost_label="$(awk -v i="$included_usd" -v a="$allowance_usd" 'BEGIN{printf "Cr: $%.2f/$%.2f", i, a}')"
+    if [[ -n "$purchased" ]]; then
+      cost_label="$cost_label$(awk -v c="$purchased" 'BEGIN{printf " +$%.2f", c}')"
+    fi
+  elif [[ -n "$purchased" ]]; then
+    cost_label="$(awk -v c="$purchased" 'BEGIN{printf "Xtr: $%.2f left", c}')"
   fi
 
   local now
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  # Ollama cloud usage windows are fixed and epoch-aligned (maintainer
-  # rick-github, ollama/ollama#12532):
-  #   session: 5h blocks, reset at the next multiple of 18000s since epoch
-  #   weekly:  7d blocks shifted by 4 days, reset at the next multiple of
-  #            604800s since epoch (Monday 00:00 UTC)
-  local epoch session_reset weekly_reset
-  epoch="$(date +%s)"
-  session_reset="$((epoch + (18000 - (epoch % 18000))))"
-  weekly_reset="$((epoch + (604800 - ((epoch - 345600) % 604800))))"
-
-  local session_reset_iso weekly_reset_iso
-  session_reset_iso="$(epoch_to_iso "$session_reset")"
-  weekly_reset_iso="$(epoch_to_iso "$weekly_reset")"
-
   mkdir -p "$(dirname "$SNAPSHOT_PATH")"
   local tmp
   tmp="$(mktemp "$SNAPSHOT_PATH.XXXXXX")"
-  cat > "$tmp" <<EOF
-{
-  "updated_at": "$now",
-  "five_hour": { "used_percentage": $session_pct, "resets_at": "$session_reset_iso" },
-  "seven_day": { "used_percentage": $weekly_pct, "resets_at": "$weekly_reset_iso" },
-  "balance_label": "$cost_label"
-}
-EOF
+  # jq (not a heredoc) builds the snapshot so the API-provided strings can
+  # never produce invalid JSON, and absent windows land as literal nulls.
+  jq -n \
+    --arg now "$now" \
+    --arg sp "$session_pct_json" --arg sr "$session_reset" \
+    --arg wp "$weekly_pct_json" --arg wr "$weekly_reset" \
+    --arg lbl "$cost_label" \
+    '{
+      updated_at: $now,
+      five_hour: {
+        used_percentage: (if $sp == "null" then null else ($sp | tonumber) end),
+        resets_at: (if $sr == "" then null else $sr end)
+      },
+      seven_day: {
+        used_percentage: (if $wp == "null" then null else ($wp | tonumber) end),
+        resets_at: (if $wr == "" then null else $wr end)
+      },
+      balance_label: $lbl
+    }' > "$tmp"
+
   mv "$tmp" "$SNAPSHOT_PATH"
   chmod 600 "$SNAPSHOT_PATH"
 }
