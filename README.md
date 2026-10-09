@@ -6,10 +6,23 @@ external usage sidecar, so the HUD can display 5h / weekly quota bars and the
 unused prepaid credits (`Xtr: $3.39 left`) even when Claude Code runs against
 Ollama (where the native `rate_limits` payload is absent).
 
+## Variants
+
+Two pollers share the same balance parsing and snapshot format:
+
+| File | Auth | Runtime | Notes |
+|---|---|---|---|
+| `ollama-usage-poller.sh` | Bearer `OLLAMA_API_KEY` (env or one of `~/.ollama/*.api.key`) | bash + `jq` + `curl` | Reference implementation; portable, install.sh sets up systemd/launchd for it |
+| `ollama-usage-poller.mjs` | ed25519 challenge-response (`~/.ollama/id_ed25519`) | Node.js 18+ | For machines with a logged-in Ollama desktop key but no API key; the exact build deployed on Jocasta |
+
+The `.mjs` signs every request with the same mechanism the Ollama server uses
+(`Authorization: <pubkey>:<sig>`, challenge `METHOD,/path?ts=<unix>`), so it
+needs no API key at all. Both write the snapshot atomically (tmp + rename,
+`chmod 600`).
+
 ## What it does
 
-`ollama-usage-poller.sh` fetches `https://ollama.com/api/balance` with your API
-key and writes a snapshot to
+The pollers fetch `https://ollama.com/api/balance` and write a snapshot to
 `~/.claude/plugins/claude-hud/ollama-usage.json`:
 
 ```json
